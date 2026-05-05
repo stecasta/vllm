@@ -93,15 +93,27 @@ def _moe_forward(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer.runner._forward_impl(
+    out = layer.runner._forward_impl(
         layer,
         hidden_states,
         router_logits,
         shared_experts_input,
         input_ids,
     )
+    # Normalize output width across MoE backends: TRTLLM writes at
+    # hidden_dim_unpadded directly, while CUTLASS may write at a different
+    # alignment (e.g. 128-byte for hidden_size=2880 -> 2944). Truncate to
+    # hidden_dim_unpadded so the fake's predicted shape is correct for any
+    # backend, and downstream consumers (AR + RMS fusion) see a buffer at
+    # the model's logical hidden_size. .contiguous() materializes the
+    # truncation so the runtime stride matches the fake's contiguous stride
+    # (otherwise the slice is a view with the original padded stride).
+    if out.shape[-1] != hidden_dim_unpadded:
+        out = out[..., :hidden_dim_unpadded].contiguous()
+    return out
 
 
 def _moe_forward_fake(
@@ -110,8 +122,17 @@ def _moe_forward_fake(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    # Some MoE backends (e.g. TRTLLM MXFP4 with VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8)
+    # return outputs at moe_config.hidden_dim_unpadded, which can be smaller than
+    # hidden_states.shape[-1] when the runner pads to a kernel-alignment boundary.
+    # The fake must report the unpadded shape so torch.compile / Inductor traces
+    # the right stride and downstream consumers (e.g. fused all-reduce + RMS) see
+    # a buffer of the correct size. We take it as an explicit int parameter
+    # rather than reaching into the layer registry, to keep this fake a pure
+    # shape function of its inputs (matching every other fake in vLLM).
+    return hidden_states.new_empty((*hidden_states.shape[:-1], hidden_dim_unpadded))
 
 
 def _moe_forward_shared(
@@ -120,15 +141,20 @@ def _moe_forward_shared(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    return layer.runner._forward_impl(
+    shared_out, fused_out = layer.runner._forward_impl(
         layer,
         hidden_states,
         router_logits,
         shared_experts_input,
         input_ids,
     )
+    # Same normalization as in _moe_forward: see comment there.
+    if fused_out.shape[-1] != hidden_dim_unpadded:
+        fused_out = fused_out[..., :hidden_dim_unpadded].contiguous()
+    return shared_out, fused_out
 
 
 def _moe_forward_shared_fake(
@@ -137,13 +163,19 @@ def _moe_forward_shared_fake(
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Output shapes:
-    # - fused_out: same as hidden_states (routed experts use transformed size)
+    # - fused_out: routed experts may write at moe_config.hidden_dim_unpadded
+    #              when the runner pads to a kernel-alignment boundary. Take
+    #              it as an explicit int rather than via layer registry lookup
+    #              (see _moe_forward_fake comment).
     # - shared_out: same as shared_experts_input if provided, else same as
-    #               hidden_states
-    # (For latent MoE: shared experts use original hidden_size, not latent size)
-    fused_out = torch.empty_like(hidden_states)
+    #               hidden_states (shared experts use the original hidden_size,
+    #               not the latent / padded size).
+    fused_out = hidden_states.new_empty(
+        (*hidden_states.shape[:-1], hidden_dim_unpadded)
+    )
     if shared_experts_input is not None:
         shared_out = torch.empty_like(shared_experts_input)
     else:
@@ -577,6 +609,7 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input,
             input_ids,
             self._encode_layer_name(),
+            self.moe_config.hidden_dim_unpadded or self.moe_config.hidden_dim,
         )
 
         #
