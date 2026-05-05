@@ -111,7 +111,15 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
+    # Some MoE backends (e.g. TRTLLM MXFP4 with VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8)
+    # return outputs at moe_config.hidden_dim_unpadded, which can be smaller than
+    # hidden_states.shape[-1] when the runner pads to a kernel-alignment boundary.
+    # The fake must report the unpadded shape so torch.compile / Inductor traces
+    # the right stride and downstream consumers (e.g. fused all-reduce + RMS) see
+    # a buffer of the correct size.
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    out_dim = layer.runner.moe_config.hidden_dim_unpadded
+    return hidden_states.new_empty((*hidden_states.shape[:-1], out_dim))
 
 
 def _moe_forward_shared(
@@ -139,11 +147,17 @@ def _moe_forward_shared_fake(
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Output shapes:
-    # - fused_out: same as hidden_states (routed experts use transformed size)
+    # - fused_out: routed experts may write at moe_config.hidden_dim_unpadded
+    #              when the runner pads to a kernel-alignment boundary. Match
+    #              the real kernel so torch.compile / Inductor traces the right
+    #              stride and downstream all-reduce-rms fusion sees the correct
+    #              buffer size.
     # - shared_out: same as shared_experts_input if provided, else same as
-    #               hidden_states
-    # (For latent MoE: shared experts use original hidden_size, not latent size)
-    fused_out = torch.empty_like(hidden_states)
+    #               hidden_states (shared experts use the original hidden_size,
+    #               not the latent / padded size).
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    out_dim = layer.runner.moe_config.hidden_dim_unpadded
+    fused_out = hidden_states.new_empty((*hidden_states.shape[:-1], out_dim))
     if shared_experts_input is not None:
         shared_out = torch.empty_like(shared_experts_input)
     else:
