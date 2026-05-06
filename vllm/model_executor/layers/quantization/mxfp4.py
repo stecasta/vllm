@@ -155,9 +155,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
     @property
     def skip_forward_padding(self) -> bool:
-        # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
-        # so can skip the padding in the forward before applying the moe method
-        return self.mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+        return False
 
     def maybe_roundup_sizes(
         self,
@@ -483,9 +481,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     @property
     def skip_forward_padding(self) -> bool:
-        # SM100_FI_MXFP4_MXFP8_TRTLLM supports padding with mxfp8 quant
-        # so can skip the padding in the forward before applying the moe method
-        return self.mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8
+        return False
 
     def maybe_roundup_sizes(
         self,

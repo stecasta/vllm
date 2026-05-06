@@ -189,7 +189,7 @@ class TrtLlmMxfp4ExpertsMonolithic(
             x_scale = None
         output = torch.empty(
             *hidden_states.shape[:-1],
-            self.hidden_dim_unpadded,
+            self.hidden_dim,
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
@@ -274,7 +274,7 @@ class TrtLlmMxfp4ExpertsModular(TrtLlmMxfp4ExpertsBase, mk.FusedMoEExpertsModula
         # The workspaces for this implementation are managed by flashinfer.
         workspace1 = (0,)
         workspace2 = (0,)
-        output = (M, self.hidden_dim_unpadded)
+        output = (M, self.hidden_dim)
         return (workspace1, workspace2, output)
 
     def apply(
