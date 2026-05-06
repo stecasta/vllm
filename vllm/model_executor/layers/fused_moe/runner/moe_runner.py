@@ -111,6 +111,39 @@ def _moe_forward_fake(
     input_ids: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
+    # The TRT-LLM MXFP4 experts kernel produces output of shape
+    # (..., hidden_dim_unpadded), which can be narrower than the padded
+    # hidden_states.shape[-1] (gpt-oss: 2880 vs 2944/3072 padded for kernel
+    # alignment). Mirror that here so inductor's assert_size_stride checks
+    # match the real op's allocation. Other backends keep the original
+    # empty_like shape.
+    #
+    # Only enable the layer-registry peek when LayerName is in use:
+    # `get_layer_from_name` mutates `forward_context.moe_layer_index` on the
+    # legacy `"from_forward_context"` sentinel path (torch < 2.11 or
+    # VLLM_USE_LAYERNAME=0), and side effects inside a fake corrupt the
+    # counter when torch.compile re-traces. Falling through to empty_like is
+    # safe on that path and matches upstream behavior pre-patch.
+    if _USE_LAYERNAME:
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_mxfp4_moe import (
+            TrtLlmMxfp4ExpertsBase,
+        )
+
+        layer = get_layer_from_name(_resolve_layer_name(layer_name))
+        quant_method = getattr(layer, "quant_method", None)
+        moe_kernel = getattr(quant_method, "moe_kernel", None)
+        # `moe_kernel` is a `FusedMoEKernel` wrapper; the actual experts
+        # class lives at `moe_kernel.impl.fused_experts`.
+        fused_experts = getattr(
+            getattr(moe_kernel, "impl", None), "fused_experts", None
+        )
+        if isinstance(fused_experts, TrtLlmMxfp4ExpertsBase):
+            hidden_dim_unpadded = (
+                layer.moe_config.hidden_dim_unpadded or layer.moe_config.hidden_dim
+            )
+            return hidden_states.new_empty(
+                (*hidden_states.shape[:-1], hidden_dim_unpadded)
+            )
     return torch.empty_like(hidden_states)
 
 

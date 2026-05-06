@@ -884,9 +884,22 @@ class LayerName(OpaqueBase):  # type: ignore[misc]
 
 
 if HAS_OPAQUE_TYPE:
-    from torch._library.opaque_object import register_opaque_type
+    from torch._library.opaque_object import MemberType, register_opaque_type
 
-    register_opaque_type(LayerName, typ="value", hoist=True)
+    # `members={"value": USE_REAL}` lets fake kernels read `LayerName.value`
+    # at trace time. Custom-op fakes (e.g. `_moe_forward_fake`) use this to
+    # look up the FusedMoE layer in the forward-context registry and decide
+    # the output shape based on the active backend (TRT-LLM MXFP4 produces
+    # output at `hidden_dim_unpadded`, narrower than the padded
+    # `hidden_states.shape[-1]`). Without USE_REAL, torch raises
+    # `AttributeError("Tried to call __getattr__ with attr 'value' on a
+    # FakeScriptObject ...")`.
+    register_opaque_type(
+        LayerName,
+        typ="value",
+        hoist=True,
+        members={"value": MemberType.USE_REAL},
+    )
 
 # On torch >= 2.11 (with VLLM_USE_LAYERNAME enabled), custom op
 # layer_name parameters use LayerName; otherwise they remain plain str.
