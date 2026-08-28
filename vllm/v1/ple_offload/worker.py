@@ -351,7 +351,13 @@ def _disk_backed_tensor(path: str, shape: tuple[int, ...], dtype: torch.dtype,
     import numpy as np
 
     _NP = {torch.bfloat16: (np.uint16, torch.uint16), torch.float16: (np.uint16, torch.uint16),
-           torch.float32: (np.uint32, torch.uint32), torch.float8_e4m3fn: (np.uint8, torch.uint8)}
+           torch.float32: (np.uint32, torch.uint32), torch.float8_e4m3fn: (np.uint8, torch.uint8),
+           torch.uint8: (np.uint8, torch.uint8), torch.int8: (np.int8, torch.int8)}
+    if dtype not in _NP:
+        raise NotImplementedError(
+            f"PLE disk offload has no numpy mapping for dtype {dtype}; "
+            "add a same-width integer entry to _NP"
+        )
     np_dtype, torch_int = _NP[dtype]
     arr = np.memmap(path, dtype=np_dtype, mode="r+" if writable else "c", shape=shape)
     with contextlib.suppress(Exception):

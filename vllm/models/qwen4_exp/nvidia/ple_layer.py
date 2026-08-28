@@ -28,6 +28,13 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMixedPrecisionConfig,
+    ModelOptNvFp4Config,
+)
+from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+    dequantize_to_dtype,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     create_fp8_scale_parameter,
     create_fp8_weight_parameter,
@@ -40,7 +47,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.model_executor.parameter import (
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -184,11 +194,136 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, layer.weight)
 
 
+NVFP4_PLE_BLOCK_SIZE = 16
+
+
+class Qwen4ExpPLENvfp4EmbeddingMethod(QuantizeMethodBase):
+    """NVFP4 PLE embedding: 4-bit packed rows with per-16 block scales.
+
+    The checkpoint layout is used as-is: packed weights are uint8
+    ``[rows, head_dim // 2]`` (two e2m1 values per byte along the row) and
+    block scales are float8_e4m3 ``[rows, head_dim // 16]``. Because the
+    packing runs along the row, rows stay contiguous and byte aligned, so a
+    row gather is an ordinary ``index_select`` on both tensors.
+
+    ``embedding`` returns the gathered rows still quantized, with the packed
+    bytes and the scale bytes concatenated into one uint8 tensor. That keeps
+    the cross-process offload buffer a single tensor of a single dtype, so the
+    IPC protocol is unchanged, and it moves 90 bytes per row instead of the
+    320 an unquantized bf16 row would cost. The consumer splits and
+    dequantizes on the accelerator.
+    """
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        block = NVFP4_PLE_BLOCK_SIZE
+        if input_size_per_partition % block:
+            raise ValueError(
+                f"NVFP4 PLE embedding dim {input_size_per_partition} must be a "
+                f"multiple of the {block}-element block size"
+            )
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        rows = sum(output_partition_sizes)
+
+        weight = ModelWeightParameter(
+            data=torch.empty(rows, input_size_per_partition // 2, dtype=torch.uint8),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = ModelWeightParameter(
+            data=torch.empty(
+                rows, input_size_per_partition // block, dtype=torch.float8_e4m3fn
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+        # ModelOpt exports one per-tensor amax reciprocal alongside the block
+        # scales; without it the block scales are only relative.
+        weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale_2", weight_scale_2)
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError("PLE NVFP4 weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Gather packed rows and their block scales, concatenated as uint8."""
+        packed = F.embedding(input_, layer.weight)
+        scales = F.embedding(input_, layer.weight_scale.view(torch.uint8))
+        return torch.cat((packed, scales), dim=-1)
+
+
+def dequantize_nvfp4_ple_rows(
+    rows: torch.Tensor,
+    head_dim: int,
+    global_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Split concatenated ``[packed | scales]`` uint8 rows and dequantize.
+
+    Inverse of :meth:`Qwen4ExpPLENvfp4EmbeddingMethod.embedding`.
+    """
+    block = NVFP4_PLE_BLOCK_SIZE
+    packed_width = head_dim // 2
+    scale_width = head_dim // block
+    if rows.shape[-1] < packed_width + scale_width:
+        raise ValueError(
+            f"NVFP4 PLE row width {rows.shape[-1]} is smaller than the "
+            f"{packed_width + scale_width} bytes required for head_dim {head_dim}"
+        )
+    flat = rows.reshape(-1, rows.shape[-1])
+    packed = flat[:, :packed_width].contiguous()
+    scales = flat[:, packed_width : packed_width + scale_width].contiguous()
+    return dequantize_to_dtype(
+        packed,
+        scales.view(torch.float8_e4m3fn),
+        global_scale,
+        output_dtype,
+        block_size=block,
+        swizzle=False,
+    )
+
+
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+
+    nvfp4_config = quant_config
+    if isinstance(nvfp4_config, ModelOptMixedPrecisionConfig):
+        # A mixed-precision checkpoint carries the PLE algorithm per module.
+        nvfp4_config = getattr(nvfp4_config, "quant_config", None) or nvfp4_config
+    if isinstance(nvfp4_config, ModelOptNvFp4Config):
+        if is_layer_skipped(
+            prefix,
+            getattr(nvfp4_config, "exclude_modules", None) or [],
+            nvfp4_config.packed_modules_mapping,
+        ):
+            return None
+        return Qwen4ExpPLENvfp4EmbeddingMethod()
 
     if not isinstance(quant_config, Fp8Config):
         return None
@@ -427,13 +562,21 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
         if output_buffer is not None:
-            output = output_buffer[:num_tokens, : self.embedding_dim]
-            torch.index_select(
-                self.ngram_embedding.weight,
-                0,
-                ngram_ids.reshape(-1),
-                out=output.reshape(-1, self.head_dim),
-            )
+            # NVFP4 rows are narrower than head_dim (packed) and carry their
+            # block scales alongside, so the fixed-width index_select fast path
+            # does not apply; fall through to the module call below.
+            if self.ngram_embedding.weight.dtype is not torch.uint8:
+                output = output_buffer[:num_tokens, : self.embedding_dim]
+                torch.index_select(
+                    self.ngram_embedding.weight,
+                    0,
+                    ngram_ids.reshape(-1),
+                    out=output.reshape(-1, self.head_dim),
+                )
+                return output
+            rows = self.ngram_embedding(ngram_ids).flatten(-2)
+            output = output_buffer[:num_tokens, : rows.shape[-1]]
+            output.copy_(rows)
             return output
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
@@ -455,7 +598,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
             retained: set[str] = set()
             for name, loaded_weight in weights:
-                if name != "ngram_embedding.weight_scale":
+                # NVFP4 ships block scales inline with the gathered rows, so
+                # the accelerator only needs the per-tensor global scale.
+                if name not in (
+                    "ngram_embedding.weight_scale",
+                    "ngram_embedding.weight_scale_2",
+                ):
                     continue
                 self.register_buffer(
                     "_offload_weight_scale",
@@ -618,6 +766,16 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
     def _get_embedding_weight_scale(self) -> torch.Tensor | None:
         embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        # NVFP4 keeps per-block scales in the gathered row; the tensor-wide
+        # scale is weight_scale_2 and is what the dequant needs.
+        weight_scale_2 = getattr(embedding, "weight_scale_2", None)
+        if weight_scale_2 is not None:
+            return weight_scale_2
+        offload_scale_2 = getattr(
+            self.ple_embedding, "_offload_weight_scale_2", None
+        )
+        if offload_scale_2 is not None:
+            return offload_scale_2
         weight_scale = getattr(embedding, "weight_scale", None)
         if weight_scale is not None:
             return weight_scale
@@ -630,6 +788,16 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
 
+        if embeddings.dtype is torch.uint8:
+            global_scale = self._get_embedding_weight_scale()
+            if global_scale is None:
+                raise RuntimeError("NVFP4 PLE embedding is missing its global scale")
+            return dequantize_nvfp4_ple_rows(
+                embeddings,
+                self.ple_embedding.head_dim,
+                global_scale,
+                output_dtype,
+            )
         if not is_fp8(embeddings):
             return embeddings
         weight_scale = self._get_embedding_weight_scale()
