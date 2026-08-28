@@ -13,7 +13,14 @@ from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
+from vllm.logger import init_logger
+
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+
+logger = init_logger(__name__)
+
+# mm_mxfp8 cannot run below these dimensions.
+MXFP8_MIN_DIM = 128
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -33,11 +40,44 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
 
     @classmethod
     def can_implement(cls, c: Mxfp8LinearLayerConfig) -> tuple[bool, str | None]:
+        # MXFP8 kernel selection is global (init_mxfp8_linear_kernel takes no
+        # per-layer shape), so shape feasibility cannot be decided here. It is
+        # decided per layer in process_weights_after_loading below.
         return True, None
+
+    @staticmethod
+    def unsupported_shape_reason(N: int, K: int) -> str | None:
+        """Why mm_mxfp8 cannot run an [N, K] weight, or None if it can."""
+        if K < MXFP8_MIN_DIM:
+            return f"K={K} < {MXFP8_MIN_DIM} (in_features too small)"
+        if K % MXFP8_BLOCK_SIZE:
+            return f"K={K} not divisible by block size {MXFP8_BLOCK_SIZE}"
+        if N < MXFP8_MIN_DIM:
+            return f"N={N} < {MXFP8_MIN_DIM} (out_features too small)"
+        return None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data  # [N, K]
         N, K = weight.shape
+
+        reason = self.unsupported_shape_reason(N, K)
+        if reason is not None:
+            # One kernel is selected for every MXFP8 layer in the model, so a
+            # narrow layer cannot be routed elsewhere at selection time. Without
+            # this, the shape assert in apply_weights fires inside a
+            # torch.compile region during profile_run, Dynamo finds no handler
+            # and engine init dies. Delegate just this layer to emulation.
+            from .emulation import EmulationMxfp8LinearKernel
+
+            logger.warning_once(
+                "mm_mxfp8 cannot run this layer (%s); falling back to MXFP8 "
+                "emulation for it. Other MXFP8 layers still use FlashInfer.",
+                reason,
+            )
+            fallback = EmulationMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+            layer._mxfp8_fallback_kernel = fallback
+            fallback.process_weights_after_loading(layer)
+            return
 
         scale_k = K // MXFP8_BLOCK_SIZE
         weight_scale_2d = layer.weight_scale.data[:N, :scale_k].contiguous()
@@ -54,6 +94,10 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        fallback = getattr(layer, "_mxfp8_fallback_kernel", None)
+        if fallback is not None:
+            return fallback.apply_weights(layer, x, bias)
+
         weight = layer.weight
         weight_scale = layer.weight_scale
         out_dtype = x.dtype
