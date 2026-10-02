@@ -14,6 +14,7 @@ from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
 )
+from vllm.models.qwen4_exp.common import QWEN4_EXP_ATTENTION_LAYER_TYPES
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
@@ -46,6 +47,14 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+def test_qwen4_exp_accepts_installed_transformers_attention_layer_type() -> None:
+    """Transformers renames the checkpoint's "full_attention" layers, and the
+    name changed in 5.18, so vLLM must accept what the installed version emits."""
+    attention_layer_types = set(_text_config().layer_types) - {"linear_attention"}
+    assert attention_layer_types
+    assert attention_layer_types <= QWEN4_EXP_ATTENTION_LAYER_TYPES
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:

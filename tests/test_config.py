@@ -4125,6 +4125,7 @@ def test_revision_resolved_for_model(mock_resolve):
         # every token and so must count as attention.
         (["linear_attention", "deepseek_sparse_attention"], 1),
         (["linear_attention", "qwen_sparse_attention"], 1),
+        (["linear_attention", "indexed_attention"], 1),
         (["linear_attention", "linear_attention"], 0),
     ],
 )

@@ -113,6 +113,7 @@ _ATTENTION_LAYER_TYPES = frozenset(
         "full_attention",
         "deepseek_sparse_attention",
         "qwen_sparse_attention",
+        "indexed_attention",
     }
 )
 """`layer_types` spellings that consume a full attention KV cache. Sparse

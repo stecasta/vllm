@@ -73,6 +73,7 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from ..common import QWEN4_EXP_ATTENTION_LAYER_TYPES
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
@@ -209,7 +210,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
-        elif layer_type == "qwen_sparse_attention":
+        elif layer_type in QWEN4_EXP_ATTENTION_LAYER_TYPES:
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:
                 self.self_attn = Qwen3NextAttention(
@@ -293,7 +294,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
-        elif self.layer_type == "qwen_sparse_attention":
+        elif self.layer_type in QWEN4_EXP_ATTENTION_LAYER_TYPES:
             attn_out = self.self_attn(
                 hidden_states=block_input,
                 positions=positions,
@@ -373,7 +374,7 @@ class Qwen4ExpModel(nn.Module):
         self._qsa_layer_ids = frozenset(
             layer_idx
             for layer_idx, layer_type in enumerate(config.layer_types)
-            if layer_type == "qwen_sparse_attention"
+            if layer_type in QWEN4_EXP_ATTENTION_LAYER_TYPES
             and getattr(config, "indexer_n_heads", None) is not None
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
