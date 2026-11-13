@@ -280,12 +280,10 @@ class DraftVocab:
             or getattr(head, "bias", None) is not None
             or lp.head_dtype not in (None, head.weight.dtype)
             or lp.scale != 1.0
-            or lp.soft_cap is not None
         ):
             raise ValueError(
                 "draft_token_map needs a full-vocabulary, unquantized lm_head "
-                "without bias, logit scaling or soft capping, run in its weight "
-                "dtype."
+                "without bias or logit scaling, run in its weight dtype."
             )
         if head.tp_size > 1:
             raise ValueError("draft_token_map does not support tensor parallelism.")
@@ -353,11 +351,15 @@ class DraftVocab:
         positions in `candidate_ids`."""
         assert self.rows is not None
         logits = self.rows(hidden_states)
+        if (soft_cap := self.logits_processor.soft_cap) is not None:
+            logits = torch.tanh(logits / soft_cap) * soft_cap
         if self.num_dynamic_rows == 0:
             return logits, None
         scores = self.scorer(hidden_states @ self.basis)
         picks = scores.topk(self.num_dynamic_rows, dim=-1, sorted=False).indices
         picked = gather_rows_gemv(hidden_states, self.weight, self.candidate_ids[picks])
+        if soft_cap is not None:
+            picked = torch.tanh(picked / soft_cap) * soft_cap
         return logits, (picked, picks)
 
 
