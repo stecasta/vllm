@@ -70,3 +70,36 @@ def test_token_map_drafts_over_listed_and_picked_rows(
     assert torch.all(kept.sum(dim=-1) == len(DRAFT_IDS) + num_rows)
     torch.testing.assert_close(logits[kept], full[kept], atol=1e-4, rtol=1e-4)
     assert torch.equal(draft_vocab.get_top_tokens(head, hidden), logits.argmax(-1))
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_rows", [0, 16])
+def test_token_map_with_soft_cap(
+    default_vllm_config, dist_init, device, dtype, num_rows
+):
+    """Gemma-style logit soft capping matches full head logits and top tokens."""
+    soft_cap = 5.0
+    head = ParallelLMHead(VOCAB, HIDDEN, disable_tp=True, params_dtype=dtype)
+    gen = torch.Generator().manual_seed(0)
+    head.weight.data.copy_(torch.randn(head.weight.shape, generator=gen))
+    head = head.to(device)
+    head.quant_method.process_weights_after_loading(head)
+    hidden = _hidden(device=device).to(dtype)
+    lp = LogitsProcessor(VOCAB, soft_cap=soft_cap)
+    draft_vocab = DraftVocab(lp, VOCAB)
+    full = draft_vocab.compute_logits(head, hidden).float()
+    draft_vocab.load_token_map(head, torch.tensor(DRAFT_IDS), num_rows)
+
+    logits = draft_vocab.compute_logits(head, hidden).float()
+    kept = logits.isfinite()
+    assert torch.all(kept[:, DRAFT_IDS])
+    assert torch.all(kept.sum(dim=-1) == len(DRAFT_IDS) + num_rows)
+    tol = 1e-4 if dtype == torch.float32 else 1e-2
+    torch.testing.assert_close(logits[kept], full[kept], atol=tol, rtol=tol)
+    top = draft_vocab.get_top_tokens(head, hidden)
+    assert torch.equal(
+        logits.gather(1, top.unsqueeze(1)).squeeze(1), logits.max(dim=-1).values
+    )
+    if dtype == torch.float32:
+        assert torch.equal(top, logits.argmax(-1))
