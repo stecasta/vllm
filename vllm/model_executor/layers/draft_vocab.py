@@ -633,11 +633,10 @@ class DraftVocab:
             or lp.head_dtype
             not in (None, head.params_dtype if quantized else head.weight.dtype)
             or lp.scale != 1.0
-            or lp.soft_cap is not None
         ):
             raise ValueError(
-                "draft_token_map needs a full-vocabulary lm_head without bias, "
-                "logit scaling or soft capping, run in its weight dtype."
+                "draft_token_map needs a full-vocabulary lm_head without bias "
+                "or logit scaling, run in its weight dtype."
             )
         if quantized and not (loaded and isinstance(head, ParallelLMHead)):
             raise ValueError(
@@ -786,12 +785,16 @@ class DraftVocab:
         rows = self.rows
         logits = rows.quant_method.apply(rows, hidden_states)
         logits = logits[..., : self.token_ids.numel()]
+        if (soft_cap := self.logits_processor.soft_cap) is not None:
+            logits = torch.tanh(logits / soft_cap) * soft_cap
         if self.num_dynamic_rows == 0:
             return logits, None
         scores = self.scorer(hidden_states @ self.basis)
         picks = scores.topk(self.num_dynamic_rows, dim=-1, sorted=False).indices
         gather_ids = self.candidate_ids[picks] if len(self.gather_rows) == 1 else picks
         picked = gather_rows_gemv(hidden_states, self.gather_rows, gather_ids)
+        if soft_cap is not None:
+            picked = torch.tanh(picked / soft_cap) * soft_cap
         return logits, (picked, picks)
 
 
